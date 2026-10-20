@@ -46,6 +46,10 @@ const CONTROL: [&str; 4] = [
     "x-kompressor-tenant",
 ];
 
+/// The Induction benchmark harness's headers, which label a request for the
+/// payload log and mean nothing to a provider.
+const INDUCTION_PREFIX: &str = "x-induction-";
+
 /// Credential headers, dropped when the upstream supplies its own.
 const CREDENTIAL: [&str; 3] = ["authorization", "x-api-key", "api-key"];
 
@@ -80,7 +84,7 @@ pub fn upstream_headers(
         if lower == "content-length" || lower == "accept-encoding" {
             continue;
         }
-        if CONTROL.contains(&lower.as_str()) {
+        if CONTROL.contains(&lower.as_str()) || lower.starts_with(INDUCTION_PREFIX) {
             continue;
         }
         if !upstream.forward_auth && CREDENTIAL.contains(&lower.as_str()) {
@@ -269,6 +273,29 @@ mod tests {
             AuthMode::Payg,
         );
         assert!(!out.contains_key("x-kompressor-mode"));
+    }
+
+    #[test]
+    fn the_benchmark_harness_headers_are_not_a_providers_business() {
+        let mut client = client_request_headers();
+        client.insert(
+            "x-induction-trajectory-id",
+            HeaderValue::from_static("traj_1"),
+        );
+        client.insert("X-Induction-Group-Id", HeaderValue::from_static("grp_1"));
+        client.insert(
+            "x-induction-config",
+            HeaderValue::from_static("passthrough=false"),
+        );
+        let out = upstream_headers(&client, &Upstream::default(), "req-1", AuthMode::Payg);
+        for name in [
+            "x-induction-trajectory-id",
+            "x-induction-group-id",
+            "x-induction-config",
+        ] {
+            assert!(!out.contains_key(name), "{name} must not be forwarded");
+        }
+        assert_eq!(out["authorization"], "Bearer sk-live");
     }
 
     #[test]

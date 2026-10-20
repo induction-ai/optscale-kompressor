@@ -42,6 +42,7 @@ use tokio::sync::mpsc::Sender;
 use kompressor_wire::ApiFamily;
 
 use crate::failopen::{FailOpen, Stage};
+use crate::payloadlog::FinalResponse;
 use crate::retrieve::{Budget, Retriever};
 use crate::sse::{SseDecoder, SseFrame, parse as parse_frame};
 use crate::tool::RETRIEVE_TOOL_NAME;
@@ -67,6 +68,11 @@ const KEEPALIVE: &[u8] = b": kompressor retrieving\n\n";
 /// until the machine knows whether this turn is ours. Both are SSE comments, so
 /// no client parses either.
 const KEEPALIVE_BUFFERING: &[u8] = b": kompressor\n\n";
+
+/// How long the payload log waits for a failed round's error body. The round
+/// has already failed, so the client hears nothing while it waits; an error
+/// body normally arrives with its headers.
+const ERROR_BODY_WAIT: Duration = Duration::from_secs(1);
 
 /// What the relay did, for the stats event the request records at the end.
 #[derive(Debug, Default)]
@@ -218,9 +224,25 @@ impl StreamRelay {
 
         loop {
             let intercept = self.retriever.is_some();
+            let mut reply = self
+                .outbound
+                .payload_log()
+                .map(|_| FinalResponse::default());
             let end = self
-                .read_round(&mut stream, &tx, outcome.rounds, &hidden, intercept)
+                .read_round(
+                    &mut stream,
+                    &tx,
+                    outcome.rounds,
+                    &hidden,
+                    intercept,
+                    &mut reply,
+                )
                 .await;
+            if let Some(log) = self.outbound.payload_log()
+                && let Some(payload) = reply.and_then(FinalResponse::into_payload)
+            {
+                log.payload_from_llm(payload);
+            }
             let (turn, usage) = match end {
                 RoundEnd::ClientGone => {
                     outcome.client_gone = true;
@@ -324,7 +346,7 @@ impl StreamRelay {
     }
 
     /// Read one upstream stream to its end, forwarding what the client should
-    /// see.
+    /// see, and showing every frame to `reply` when the payload log wants it.
     async fn read_round(
         &self,
         stream: &mut BoxStream<'static, reqwest::Result<Bytes>>,
@@ -332,6 +354,7 @@ impl StreamRelay {
         rounds: u32,
         hidden: &Value,
         intercept: bool,
+        reply: &mut Option<FinalResponse>,
     ) -> RoundEnd {
         let mut decoder = SseDecoder::new();
         let mut turn = StreamTurn::new(self.family);
@@ -466,6 +489,9 @@ impl StreamRelay {
             }
 
             while let Some(frame) = decoder.next_frame() {
+                if let Some(reply) = reply.as_mut() {
+                    reply.observe(&frame);
+                }
                 if let Some(carried) = frame_usage(self.family, &frame) {
                     // The maximum, not the sum: these frames are two reports of
                     // one call, and summing them doubled the whole input side.
@@ -683,6 +709,9 @@ impl StreamRelay {
         }
 
         if let Some(frame) = decoder.flush() {
+            if let Some(reply) = reply.as_mut() {
+                reply.observe(&frame);
+            }
             match state {
                 State::Passthrough => {
                     if !self.emit(tx, &frame, rounds, hidden).await {
@@ -773,6 +802,13 @@ impl StreamRelay {
         if !response.status().is_success() {
             self.failopen
                 .record(Stage::RetrieveRound, &response.status());
+            if let Some(log) = self.outbound.payload_log() {
+                let headers = response.headers().clone();
+                if let Ok(Ok(body)) = tokio::time::timeout(ERROR_BODY_WAIT, response.bytes()).await
+                {
+                    log.payload_from_llm_body(&body, &headers);
+                }
+            }
             return None;
         }
         Some(Box::pin(response.bytes_stream()))

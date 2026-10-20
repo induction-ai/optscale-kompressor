@@ -102,6 +102,9 @@ pub(crate) async fn run(
                 return Err(error);
             }
         };
+        if let Some(log) = outbound.payload_log() {
+            log.payload_from_llm_body(&body, &headers);
+        }
 
         let Some(family) = family else {
             return Ok(finish(status, headers, body, rounds, injected, None));

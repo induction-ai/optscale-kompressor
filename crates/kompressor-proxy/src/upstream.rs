@@ -15,6 +15,7 @@ use http::{HeaderMap, Method};
 use serde_json::Value;
 
 use crate::bodycodec::BodyEncoding;
+use crate::payloadlog::RequestLog;
 
 /// A request in flight to the provider.
 pub(crate) struct Outbound {
@@ -41,6 +42,13 @@ pub(crate) struct Outbound {
     /// understate the wait by exactly the part the loop added. Accumulating at
     /// the one place every path goes through is what stops the two disagreeing.
     waited_us: Arc<AtomicU64>,
+    log: Option<PayloadLog>,
+}
+
+/// The request's payload log, and `body` as it was before `encoding`.
+struct PayloadLog {
+    request: Arc<RequestLog>,
+    plain: Bytes,
 }
 
 impl Outbound {
@@ -62,7 +70,22 @@ impl Outbound {
             timeout: None,
             encoding,
             waited_us: Arc::new(AtomicU64::new(0)),
+            log: None,
         }
+    }
+
+    /// Write every call this request sends, and its reply, to `log`. `plain`
+    /// is the body before its content coding.
+    pub(crate) fn with_log(mut self, log: Arc<RequestLog>, plain: Bytes) -> Outbound {
+        self.log = Some(PayloadLog {
+            request: log,
+            plain,
+        });
+        self
+    }
+
+    pub(crate) fn payload_log(&self) -> Option<&Arc<RequestLog>> {
+        self.log.as_ref().map(|log| &log.request)
     }
 
     /// Keep the parsed body so later rounds can append to it.
@@ -107,6 +130,9 @@ impl Outbound {
         };
         self.body = encoded;
         self.json = Some(value);
+        if let Some(log) = &mut self.log {
+            log.plain = Bytes::from(bytes);
+        }
         true
     }
 
@@ -121,6 +147,9 @@ impl Outbound {
     /// wait before the provider said anything, which is the half a proxy can
     /// be blamed for being slow on top of.
     pub(crate) async fn send(&self) -> reqwest::Result<reqwest::Response> {
+        if let Some(log) = &self.log {
+            log.request.payload_to_llm(&log.plain);
+        }
         let mut request = self
             .client
             .request(self.method.clone(), &self.url)

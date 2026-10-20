@@ -36,6 +36,7 @@ use crate::bodycapture;
 use crate::bodycodec;
 use crate::failopen::Stage;
 use crate::mode::ProxyMode;
+use crate::payloadlog::{self, RequestLog, StreamToClient};
 use crate::prefixcache;
 use crate::retrieve::{Budget, Retriever};
 use crate::stream::{ClientChunk, StreamRelay};
@@ -189,6 +190,18 @@ async fn run(state: ProxyState, request: axum::extract::Request, request_id: Str
     } else {
         detect_family(&route.path)
     };
+    // Kompressor's own id joins the records to this proxy's stats and traces.
+    let payload_log = (parts.method == Method::POST && family == Some(ApiFamily::OpenAiResponses))
+        .then(payloadlog::path)
+        .flatten()
+        .map(|path| {
+            let log_id = if client_request_id(&parts.headers).is_some() {
+                new_request_id()
+            } else {
+                request_id.clone()
+            };
+            RequestLog::begin(path, log_id, &parts.headers, &decoded)
+        });
     let prepared = prepare(
         &state,
         &identity,
@@ -214,23 +227,22 @@ async fn run(state: ProxyState, request: axum::extract::Request, request_id: Str
 
     let upstream_headers =
         headers::upstream_headers(&parts.headers, upstream, &request_id, auth_mode);
-    // What actually goes out. Unchanged means unchanged: the bytes that
-    // arrived, in the coding they arrived in. Only a body this proxy rewrote
-    // is re-encoded, and if that fails the original ships rather than a body
-    // whose `content-encoding` lies about it.
-    let outbound_body = if prepared.body == decoded {
+    // What goes out, and as `plain` that body without its content coding. Only
+    // a body this proxy rewrote is re-encoded, and if that fails the original
+    // ships rather than a body whose `content-encoding` lies about it.
+    let (outbound_body, plain) = if prepared.body == decoded {
         // Unchanged: the bytes that arrived, in the coding they arrived in.
-        wire
+        (wire, decoded.clone())
     } else if !encoding.is_encoded() {
-        prepared.body.clone()
+        (prepared.body.clone(), prepared.body.clone())
     } else {
         match encoding.encode(&prepared.body) {
-            Some(encoded) => encoded,
+            Some(encoded) => (encoded, prepared.body.clone()),
             None => {
                 state
                     .failopen
                     .record(Stage::Parse, &"the rewritten body could not be re-encoded");
-                wire
+                (wire, decoded.clone())
             }
         }
     };
@@ -248,6 +260,9 @@ async fn run(state: ProxyState, request: axum::extract::Request, request_id: Str
         }
         if !prepared.stream {
             outbound = outbound.with_timeout(proxy.upstream_read_timeout);
+        }
+        if let Some(log) = payload_log {
+            outbound = outbound.with_log(log, plain);
         }
         outbound
     };
@@ -1096,17 +1111,19 @@ fn unparsed_asks_to_stream(body: &[u8], headers: &HeaderMap) -> bool {
 /// followed through the compression event, the retrieval events and the proxy
 /// event without a join on timestamps.
 fn request_id(headers: &HeaderMap) -> String {
+    client_request_id(headers).unwrap_or_else(new_request_id)
+}
+
+/// The client's own `x-request-id`, when it sent one this proxy accepts.
+fn client_request_id(headers: &HeaderMap) -> Option<String> {
     headers
         .get(headers::REQUEST_ID)
         .and_then(|value| value.to_str().ok())
         .map(str::trim)
         .filter(|value| !value.is_empty() && value.len() <= 128)
         .map(str::to_string)
-        .unwrap_or_else(new_request_id)
 }
 
-/// A sortable, collision-free-enough identifier without pulling in a uuid
-/// dependency: milliseconds since the epoch, then a process-wide counter.
 fn new_request_id() -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -1511,6 +1528,7 @@ async fn buffered_response(
     mode: ProxyMode,
     started: Instant,
 ) -> Response {
+    let payload_log = outbound.payload_log().cloned();
     let relayed = match nonstream::run(
         outbound,
         family,
@@ -1523,11 +1541,7 @@ async fn buffered_response(
         Ok(relayed) => relayed,
         Err(error) => {
             recorder.finish(None, 0, 0, None, started, Some(error.to_string()));
-            return error_response(
-                StatusCode::BAD_GATEWAY,
-                "the upstream could not be reached",
-                &request_id,
-            );
+            return unreachable_upstream(&request_id, payload_log.as_deref());
         }
     };
 
@@ -1547,6 +1561,9 @@ async fn buffered_response(
         started,
         None,
     );
+    if let Some(log) = &payload_log {
+        log.payload_to_client_body(&relayed.body, &relayed.headers);
+    }
 
     let mut response = Response::new(Body::from(relayed.body));
     *response.status_mut() = relayed.status;
@@ -1567,15 +1584,12 @@ async fn stream_response(
     mode: ProxyMode,
     started: Instant,
 ) -> Response {
+    let payload_log = outbound.payload_log().cloned();
     let upstream = match outbound.send().await {
         Ok(response) => response,
         Err(error) => {
             recorder.finish(None, 0, 0, None, started, Some(error.to_string()));
-            return error_response(
-                StatusCode::BAD_GATEWAY,
-                "the upstream could not be reached",
-                &request_id,
-            );
+            return unreachable_upstream(&request_id, payload_log.as_deref());
         }
     };
 
@@ -1596,8 +1610,15 @@ async fn stream_response(
     // An error, or a response that is not an event stream after all, is a whole
     // body: relaying it as one is both simpler and what the client expects.
     if !status.is_success() || !is_event_stream(upstream.headers(), prepared.stream) {
-        let body = upstream.bytes().await.unwrap_or_default();
+        let body = upstream.bytes().await;
+        if let (Some(log), Ok(body)) = (&payload_log, &body) {
+            log.payload_from_llm_body(body, &response_headers);
+        }
+        let body = body.unwrap_or_default();
         recorder.finish(Some(status.as_u16()), 0, 0, None, started, None);
+        if let Some(log) = &payload_log {
+            log.payload_to_client_body(&body, &response_headers);
+        }
         let mut response = Response::new(Body::from(body));
         *response.status_mut() = status;
         *response.headers_mut() = response_headers;
@@ -1634,9 +1655,14 @@ async fn stream_response(
         capture: bodycapture::path(),
     };
 
+    let to_client = payload_log.map(StreamToClient::new);
+    let relay_holds = to_client.clone();
     let (tx, rx) = tokio::sync::mpsc::channel::<ClientChunk>(32);
     tokio::spawn(async move {
         let outcome = relay.run(upstream, tx).await;
+        // The client's record waits for this, so it lands after the relay's
+        // last upstream reply.
+        drop(relay_holds);
         // A stream the client walked out on still gets a row, and the row says
         // so. Without the note it is a healthy 200 carrying usage for tokens
         // that reached nobody, which is worse than no row at all: it is a row
@@ -1658,9 +1684,16 @@ async fn stream_response(
         );
     });
 
-    let body = Body::from_stream(futures_util::stream::unfold(rx, |mut rx| async move {
-        rx.recv().await.map(|chunk| (chunk, rx))
-    }));
+    let body = Body::from_stream(futures_util::stream::unfold(
+        (rx, to_client),
+        |(mut rx, to_client)| async move {
+            let chunk = rx.recv().await?;
+            if let (Some(record), Ok(bytes)) = (&to_client, &chunk) {
+                record.push(bytes);
+            }
+            Some((chunk, (rx, to_client)))
+        },
+    ));
     let mut response = Response::new(body);
     *response.status_mut() = status;
     *response.headers_mut() = response_headers;
@@ -1691,9 +1724,23 @@ fn is_event_stream(headers: &HeaderMap, asked_for_stream: bool) -> bool {
     }
 }
 
+/// The 502 for an upstream that could not be reached, written to the payload
+/// log as what the client received.
+fn unreachable_upstream(request_id: &str, payload_log: Option<&RequestLog>) -> Response {
+    const MESSAGE: &str = "the upstream could not be reached";
+    if let Some(log) = payload_log {
+        log.payload_to_client(error_body(MESSAGE));
+    }
+    error_response(StatusCode::BAD_GATEWAY, MESSAGE, request_id)
+}
+
+fn error_body(message: &str) -> Value {
+    json!({"error": {"message": message, "type": "kompressor_proxy_error"}})
+}
+
 /// The proxy's own errors, in the shape every provider client already parses.
 fn error_response(status: StatusCode, message: &str, request_id: &str) -> Response {
-    let body = json!({"error": {"message": message, "type": "kompressor_proxy_error"}});
+    let body = error_body(message);
     let mut response = Response::new(Body::from(body.to_string()));
     *response.status_mut() = status;
     response.headers_mut().insert(

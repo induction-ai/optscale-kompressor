@@ -69,6 +69,7 @@ mod handler;
 pub mod headers;
 pub mod mode;
 mod nonstream;
+mod payloadlog;
 mod piggyback;
 pub mod prefixcache;
 pub mod retrieve;
