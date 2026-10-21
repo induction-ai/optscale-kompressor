@@ -213,6 +213,45 @@ fn detect_says_when_a_payload_was_never_classified_because_it_is_too_small() {
         .stdout(predicate::str::contains("below min_compress_chars"));
 }
 
+fn shell_result(stdout: &str, stderr: &str) -> String {
+    format!(
+        "<shell_results>\n<exit_code>0</exit_code>\n<stdout>{stdout}</stdout>\n<stderr>{stderr}</stderr>\n</shell_results>"
+    )
+}
+
+#[test]
+fn detect_names_the_type_of_what_a_stirrup_result_holds() {
+    let table: String = std::iter::once("id,name,score\n".to_string())
+        .chain((0..40).map(|i| format!("{i},user_{i},{}\n", i * 3)))
+        .collect();
+    let assert = kompressor()
+        .args(["detect", "--json"])
+        .write_stdin(shell_result(&table, ""))
+        .assert()
+        .success();
+    let value: serde_json::Value = serde_json::from_slice(&assert.get_output().stdout).unwrap();
+
+    assert_eq!(value["content_type"], "tabular");
+    assert_eq!(value["strategy"], "tabular");
+    assert_eq!(value["chars"], table.chars().count());
+}
+
+#[test]
+fn explain_applies_the_size_gate_to_what_a_stirrup_result_holds() {
+    // Large overall, but stderr is kept as it is and stdout is two characters.
+    let assert = kompressor()
+        .args(["compress", "--explain"])
+        .write_stdin(shell_result("ok", &foldable_log()))
+        .assert()
+        .success();
+    let explanation = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
+
+    assert!(
+        explanation.contains("size gate    BELOW THE GATE"),
+        "{explanation}"
+    );
+}
+
 #[test]
 fn explain_names_the_winning_route_and_every_decision_behind_it() {
     let assert = kompressor()

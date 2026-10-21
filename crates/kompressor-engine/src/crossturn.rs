@@ -97,8 +97,19 @@ fn is_anchorable(line: &str) -> bool {
 impl SeenText {
     /// Record what a message shipped, so later messages can point at it.
     pub fn push(&mut self, text: &str) {
+        self.push_parts(&[text]);
+    }
+
+    /// Record a message shipped as separate parts, such as an envelope's head,
+    /// payload and tail, each split into lines on its own so that a payload's
+    /// first line is not recorded glued to the tag before it.
+    pub fn push_parts(&mut self, parts: &[&str]) {
         let ordinal = self.messages.len();
-        let lines: Vec<String> = split_lines(text).into_iter().map(str::to_string).collect();
+        let lines: Vec<String> = parts
+            .iter()
+            .flat_map(|part| split_lines(part))
+            .map(str::to_string)
+            .collect();
         for (offset, line) in lines.iter().enumerate() {
             if !is_anchorable(line) {
                 continue;

@@ -1,6 +1,7 @@
 //! `kompressor compress` and `kompressor detect`.
 
 use kompressor_engine::detect::{detect_result, strategy_for};
+use kompressor_engine::envelope::payload_of;
 use kompressor_engine::options::EngineOptions;
 use kompressor_engine::pipeline::compress_content;
 use kompressor_engine::types::{Context, ForcedType, Kind, Mode};
@@ -184,7 +185,8 @@ pub struct DetectArgs {
 pub fn detect(args: DetectArgs) -> CliResult {
     let content = read_input(args.file.as_deref())?;
     let options = load_engine(args.config.as_deref())?;
-    let detection = detect_result(&content, &args.role, &options);
+    let payload = payload_of(&content);
+    let detection = detect_result(payload, &args.role, &options);
     let strategy = strategy_name(strategy_for(&detection, &options));
     let view = DetectionView::new(&detection);
 
@@ -192,7 +194,7 @@ pub fn detect(args: DetectArgs) -> CliResult {
         let mut value = serde_json::to_value(&view)
             .map_err(|e| CliError::runtime("rendering the detection", e))?;
         value["strategy"] = json!(strategy);
-        value["chars"] = json!(content.chars().count());
+        value["chars"] = json!(payload.chars().count());
         print_json(&value)?;
     } else {
         println!("content_type  {}", view.content_type);

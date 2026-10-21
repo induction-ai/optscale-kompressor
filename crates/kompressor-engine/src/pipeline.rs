@@ -19,6 +19,7 @@ use crate::configs::crush_config;
 use crate::crusher::crush_json;
 use crate::detect::{detect_result, strategy_for};
 use crate::diff::crush_diff;
+use crate::envelope::split_envelope;
 use crate::gutter::split_line_gutter;
 use crate::listing::crush_listing;
 use crate::logs::{Identity, build_identity, crush_log};
@@ -73,6 +74,25 @@ const SEGMENTER_MIN_SAVING: f32 = 0.20;
 /// unfold one heterogeneous message into the real types it contained instead of
 /// reporting the opaque `mixed`.
 pub fn compress_content<'a>(
+    content: &'a str,
+    role: &str,
+    opts: &EngineOptions,
+    forced: Option<ForcedType>,
+    refs: &mut RefCollector,
+    ctx: &Context,
+    applied: &mut Vec<Kind>,
+) -> (Cow<'a, str>, Option<Kind>) {
+    let Some(envelope) = split_envelope(content) else {
+        return compress_payload(content, role, opts, forced, refs, ctx, applied);
+    };
+    match compress_payload(envelope.payload, role, opts, forced, refs, ctx, applied) {
+        (out, Some(kind)) => (Cow::Owned(envelope.wrap(&out)), Some(kind)),
+        (_, None) => (Cow::Borrowed(content), None),
+    }
+}
+
+/// Compress a payload no envelope is wrapped around.
+fn compress_payload<'a>(
     content: &'a str,
     role: &str,
     opts: &EngineOptions,
@@ -1478,5 +1498,168 @@ mod gutter_tests {
         }
         let (out, _) = run(&content, &opts());
         assert!(out.len() <= content.len(), "invariant: never larger");
+    }
+}
+
+#[cfg(test)]
+mod envelope_tests {
+    use super::*;
+
+    fn opts() -> EngineOptions {
+        EngineOptions {
+            mode: Mode::Recoverable,
+            ..Default::default()
+        }
+    }
+
+    /// The output, the type, what was applied, and the fragments retained.
+    fn run(content: &str) -> (String, Option<Kind>, Vec<Kind>, Vec<String>) {
+        let opts = opts();
+        let mut refs = opts.collector();
+        let mut applied = Vec::new();
+        let ctx = Context::for_role("tool");
+        let (out, kind) =
+            compress_content(content, "tool", &opts, None, &mut refs, &ctx, &mut applied);
+        let fragments = refs.pairs().iter().map(|(_, f)| f.clone()).collect();
+        (out.into_owned(), kind, applied, fragments)
+    }
+
+    fn log_payload(lines: usize) -> String {
+        (0..lines)
+            .map(|i| {
+                format!(
+                    "2026-01-02T03:04:{:02}Z INFO worker seq={i} value={}\n",
+                    i % 60,
+                    i * 7
+                )
+            })
+            .collect()
+    }
+
+    const SHELL_HEAD: &str = "<shell_results>\n<exit_code>0</exit_code>\n<stdout>";
+
+    #[test]
+    fn a_payload_in_any_envelope_compresses_exactly_as_it_would_bare() {
+        let payload = log_payload(300);
+        let bare = run(&payload);
+        assert!(bare.1.is_some(), "the bare payload compresses");
+
+        for (head, tail) in [
+            (
+                SHELL_HEAD,
+                "</stdout>\n<stderr>pip: a newer version is available\n</stderr>\n</shell_results>",
+            ),
+            (
+                "<shell_results>\n<error_kind>timeout</error_kind>\n<details>",
+                "</details>\n</shell_results>",
+            ),
+            (
+                "<shell_results>\n<error_kind>timeout</error_kind>\n<details>",
+                "</details>\n<advice>Run it in the background.</advice>\n</shell_results>",
+            ),
+            (
+                "<web_fetch><url>https://example.com/build.log</url><body>",
+                "</body></web_fetch>",
+            ),
+            (
+                "<web_fetch><url>https://example.com/build.log</url><error>",
+                "</error></web_fetch>",
+            ),
+            ("<page_snapshot>\n", "\n</page_snapshot>"),
+            (
+                "<sub_agent_result>\n<response>",
+                "</response>\n<finished>True</finished>\n</sub_agent_result>",
+            ),
+            (
+                "<sub_agent_result>\n<response>",
+                "</response>\n<finished>False</finished>\n</sub_agent_result>",
+            ),
+            (
+                "<sub_agent_result>\n<error>",
+                "</error>\n</sub_agent_result>",
+            ),
+            // a sub-agent handing back a command's result
+            (
+                "<sub_agent_result>\n<response><shell_results>\n<exit_code>1</exit_code>\n<stdout>",
+                "</stdout>\n<stderr></stderr>\n</shell_results></response>\n<finished>True</finished>\n</sub_agent_result>",
+            ),
+        ] {
+            let content = format!("{head}{payload}{tail}");
+            let (out, kind, applied, fragments) = run(&content);
+            assert_eq!(out, format!("{head}{}{tail}", bare.0), "{head:?}");
+            assert_eq!(kind, bare.1, "{head:?}");
+            assert_eq!(applied, bare.2, "{head:?}");
+            assert_eq!(fragments, bare.3, "fragments hold payload text only");
+            assert_eq!(run(&content).0, out, "the same bytes every turn");
+        }
+    }
+
+    #[test]
+    fn a_search_result_list_compresses_exactly_as_it_would_bare() {
+        let results: Vec<String> = (0..60)
+            .map(|i| {
+                format!(
+                    "<result>\n<title>cadquery fillet guide, part {i}</title>\n<url>https://example.com/cadquery/{i}</url>\n<description>How fillet() picks edges, part {i}.</description>\n</result>"
+                )
+            })
+            .collect();
+        let payload = results.join("\n");
+        let (bare, bare_kind, _, _) = run(&payload);
+        assert!(bare_kind.is_some(), "the bare list compresses");
+
+        let (out, kind, _, _) = run(&format!("<results>\n{payload}\n</results>"));
+        assert_eq!(kind, bare_kind);
+        assert_eq!(out, format!("<results>\n{bare}\n</results>"));
+    }
+
+    #[test]
+    #[cfg(feature = "code-aware")]
+    fn source_printed_by_a_command_is_compressed_as_source() {
+        let mut source = String::from("import os\n\n");
+        for f in 0..4 {
+            source.push_str(&format!("def transform_{f}(records, options=None):\n"));
+            for line in 0..40 {
+                source.push_str(&format!(
+                    "    value_{line} = records[{line}] * {f} + options.get('k{line}', {line})\n"
+                ));
+            }
+            source.push_str("    return value_0\n\n");
+        }
+        let (bare, bare_kind, _, _) = run(&source);
+        assert_eq!(
+            bare_kind,
+            Some(Kind::SourceCode),
+            "the bare file reads as source"
+        );
+
+        let tail = "</stdout>\n<stderr></stderr>\n</shell_results>";
+        let (out, kind, _, _) = run(&format!("{SHELL_HEAD}{source}{tail}"));
+        assert_eq!(kind, Some(Kind::SourceCode));
+        assert_eq!(out, format!("{SHELL_HEAD}{bare}{tail}"));
+    }
+
+    #[test]
+    fn stderr_is_never_compressed_however_large() {
+        // Stirrup's stderr stays with the tags, so a result whose stdout is
+        // too small to compress ships whole.
+        let content = format!(
+            "{SHELL_HEAD}/usr/local/bin/uv\n</stdout>\n<stderr>{}</stderr>\n</shell_results>",
+            log_payload(300)
+        );
+        let (out, kind, _, fragments) = run(&content);
+        assert_eq!(kind, None);
+        assert_eq!(out, content);
+        assert!(fragments.is_empty());
+    }
+
+    #[test]
+    fn a_nest_deeper_than_the_bound_is_left_whole() {
+        let mut content = log_payload(300);
+        for _ in 0..=crate::envelope::MAX_LAYERS {
+            content = format!("<page_snapshot>\n{content}\n</page_snapshot>");
+        }
+        let (out, kind, _, _) = run(&content);
+        assert_eq!(kind, None);
+        assert_eq!(out, content);
     }
 }

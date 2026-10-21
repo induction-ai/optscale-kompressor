@@ -5,6 +5,7 @@ use std::time::Instant;
 
 use kompressor_engine::code::crush_code;
 use kompressor_engine::detect::detect_result;
+use kompressor_engine::envelope::{payload_of, split_envelope};
 use kompressor_engine::markers::has_marker;
 use kompressor_engine::options::EngineOptions;
 use kompressor_engine::pipeline::compress_content;
@@ -277,7 +278,8 @@ pub fn replay(
 /// One payload, compressed and scored.
 fn replay_one(payload: &Payload, options: &EngineOptions, verify: bool) -> PayloadResult {
     let chars_in = chars_len(&payload.content);
-    let detection = detect_result(&payload.content, &payload.role, options);
+    let inside = payload_of(&payload.content);
+    let detection = detect_result(inside, &payload.role, options);
 
     let mut refs = options.collector();
     let mut applied = Vec::new();
@@ -305,7 +307,7 @@ fn replay_one(payload: &Payload, options: &EngineOptions, verify: bool) -> Paylo
         bucket: bucket_name(kind, detection.content_type),
         detected_as: detection.content_type,
         kind,
-        eligible: chars_in >= options.min_compress_chars,
+        eligible: chars_len(inside) >= options.min_compress_chars,
         chars_in,
         chars_out: chars_len(&output),
         elapsed_ms,
@@ -379,6 +381,15 @@ fn check_invariants(
     // matches and keeps no fragment by design; that is the mode's own
     // contract, and 126 corpus payloads exercise it.
     if refs.is_enabled() {
+        // An envelope's payload is what was folded, and `<stdout>` is glued to
+        // its first line on the wire.
+        let payloads = split_envelope(content).and_then(|envelope| {
+            let inside = output
+                .strip_prefix(envelope.head)?
+                .strip_suffix(envelope.tail)?;
+            Some((envelope.payload, inside))
+        });
+        let (content, output) = payloads.unwrap_or((content, output));
         violations.extend(check_bare_folds(content, output));
     }
 
@@ -635,6 +646,32 @@ mod tests {
     }
 
     #[test]
+    fn a_stirrup_result_is_sized_and_classified_by_what_it_holds() {
+        let options = EngineOptions::default();
+        let shell = |stdout: &str, stderr: &str| {
+            format!(
+                "<shell_results>\n<exit_code>0</exit_code>\n<stdout>{stdout}</stdout>\n<stderr>{stderr}</stderr>\n</shell_results>"
+            )
+        };
+        let table: String = std::iter::once("id,name,score\n".to_string())
+            .chain((0..40).map(|i| format!("{i},user_{i},{}\n", i * 3)))
+            .collect();
+        let report = replay(
+            &[
+                payload("a", &shell("ok\n", &foldable_log()), 1),
+                payload("b", &shell(&table, ""), 1),
+            ],
+            &options,
+            false,
+        );
+        assert!(
+            !report.results[0].eligible,
+            "its stdout alone is under the gate"
+        );
+        assert_eq!(report.results[1].detected_as, ContentType::Tabular);
+    }
+
+    #[test]
     fn billed_weights_a_payload_by_the_requests_that_carried_it() {
         let options = EngineOptions::default();
         let log = foldable_log();
@@ -738,6 +775,35 @@ mod tests {
                 found: 2,
             }]
         );
+    }
+
+    #[test]
+    fn the_checker_reads_an_envelope_the_way_the_engine_does() {
+        // The fold runs on what the envelope holds, so the first line it
+        // counts is not the one `<stdout>` is glued to on the wire.
+        let content = format!(
+            "<shell_results>\n<exit_code>0</exit_code>\n<stdout>{}</stdout>\n<stderr></stderr>\n</shell_results>",
+            "same line from a noisy build\n".repeat(300)
+        );
+        let opts = EngineOptions {
+            mode: Mode::Recoverable,
+            ..Default::default()
+        };
+        let mut refs = opts.collector();
+        let (output, kind) = compress_content(
+            &content,
+            "tool",
+            &opts,
+            None,
+            &mut refs,
+            &Context::for_role("tool"),
+            &mut Vec::new(),
+        );
+        assert!(
+            output.contains("<stdout>same line from a noisy build [\u{d7}"),
+            "the first line carries a bare count: {output}"
+        );
+        assert_eq!(check_invariants(&content, &output, kind, &refs), vec![]);
     }
 
     #[test]

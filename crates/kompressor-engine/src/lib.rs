@@ -41,6 +41,7 @@ pub mod crusher;
 pub mod detect;
 pub mod diff;
 pub mod echo;
+pub mod envelope;
 pub mod gutter;
 pub mod listing;
 pub mod logs;

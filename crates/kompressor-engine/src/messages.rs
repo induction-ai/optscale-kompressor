@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::crossturn::SeenText;
 use crate::detect::detect_result;
+use crate::envelope::{payload_of, split_envelope};
 use crate::markers::stale_read_marker;
 use crate::options::EngineOptions;
 use crate::pipeline::compress_content;
@@ -575,6 +576,7 @@ fn decline_reason(content: &MessageContent, role: &str, opts: &EngineOptions) ->
             .unwrap_or(""),
         MessageContent::Opaque => return "opaque".to_string(),
     };
+    let text = payload_of(text);
     if chars_len(text) < opts.min_compress_chars {
         return "below_min_chars".to_string();
     }
@@ -706,6 +708,7 @@ pub fn compress_messages(
             continue;
         }
 
+        let frame = Frame::of(&messages[index].content);
         let chars_before = messages[index].content.text_len() as u64;
         stats.chars_in += chars_before;
         stats.tokens_in += count_tokens(&messages[index].content, &role);
@@ -739,7 +742,7 @@ pub fn compress_messages(
             stats.skip(&skipped_as, count_tokens(&messages[index].content, &role));
             stats.tokens_out += count_tokens(&messages[index].content, &role);
             stats.chars_out += chars_before;
-            seen.push(&messages[index].content.joined_text());
+            record(&mut seen, &messages[index].content, frame.as_ref());
             continue;
         }
 
@@ -758,21 +761,31 @@ pub fn compress_messages(
         if stale
             && refs.is_enabled()
             && let MessageContent::Text(text) = &messages[index].content
-            && text.len() <= refs.max_ref_bytes()
         {
-            let mark = refs.mark();
-            let path = messages[index]
-                .meta
-                .file_path
-                .clone()
-                .unwrap_or_else(|| "unknown".to_string());
-            let marker = stale_read_marker(&path, text, refs);
-            if chars_len(&marker) < chars_len(text) {
-                messages[index].content = MessageContent::Text(marker);
-                applied.push(Kind::StaleRead);
-                compressed_here = true;
-            } else {
-                refs.rollback(mark);
+            // An envelope keeps its tags; what went stale is what it holds.
+            let read = frame
+                .as_ref()
+                .and_then(|frame| frame.payload(text))
+                .unwrap_or(text);
+            if read.len() <= refs.max_ref_bytes() {
+                let mark = refs.mark();
+                let path = messages[index]
+                    .meta
+                    .file_path
+                    .clone()
+                    .unwrap_or_else(|| "unknown".to_string());
+                let marker = stale_read_marker(&path, read, refs);
+                if chars_len(&marker) < chars_len(read) {
+                    let replaced = match &frame {
+                        Some(frame) => frame.wrap(&marker),
+                        None => marker,
+                    };
+                    messages[index].content = MessageContent::Text(replaced);
+                    applied.push(Kind::StaleRead);
+                    compressed_here = true;
+                } else {
+                    refs.rollback(mark);
+                }
             }
         }
 
@@ -853,7 +866,7 @@ pub fn compress_messages(
         if opts.enable_cross_turn_dedup
             && !seen.is_empty()
             && let MessageContent::Text(text) = &mut messages[index].content
-            && let Some(folded) = seen.fold(text, opts)
+            && let Some(folded) = fold_payload(&seen, text, frame.as_ref(), opts)
         {
             *text = folded;
             applied.push(Kind::CrossTurn);
@@ -945,7 +958,7 @@ pub fn compress_messages(
             }
         }
 
-        seen.push(&messages[index].content.joined_text());
+        record(&mut seen, &messages[index].content, frame.as_ref());
 
         if compressed_here {
             stats.compressed_messages += 1;
@@ -972,6 +985,61 @@ pub fn compress_messages(
     stats.protected_refs = protected_ref_ids.into_iter().collect();
     stats.kept_inline_refs = kept_inline_ids.into_iter().collect();
     stats.finish(opts.mode, refs)
+}
+
+/// The head and tail of the envelope a tool result arrived in.
+///
+/// Taken before compression and kept: what compression leaves between them
+/// need not read as that envelope's payload again (a search list can end in an
+/// omission marker rather than `</result>`), so the text is never split anew.
+struct Frame {
+    head: String,
+    tail: String,
+}
+
+impl Frame {
+    fn of(content: &MessageContent) -> Option<Frame> {
+        let MessageContent::Text(text) = content else {
+            return None;
+        };
+        let envelope = split_envelope(text)?;
+        Some(Frame {
+            head: envelope.head.to_string(),
+            tail: envelope.tail.to_string(),
+        })
+    }
+
+    fn payload<'t>(&self, text: &'t str) -> Option<&'t str> {
+        text.strip_prefix(self.head.as_str())?
+            .strip_suffix(self.tail.as_str())
+    }
+
+    fn wrap(&self, payload: &str) -> String {
+        format!("{}{payload}{}", self.head, self.tail)
+    }
+}
+
+/// Cross-turn dedup on the payload alone, so no envelope tag is ever counted
+/// as a line shown earlier.
+fn fold_payload(
+    seen: &SeenText,
+    text: &str,
+    frame: Option<&Frame>,
+    opts: &EngineOptions,
+) -> Option<String> {
+    let Some(frame) = frame else {
+        return seen.fold(text, opts);
+    };
+    let folded = seen.fold(frame.payload(text)?, opts)?;
+    Some(frame.wrap(&folded))
+}
+
+fn record(seen: &mut SeenText, content: &MessageContent, frame: Option<&Frame>) {
+    let text = content.joined_text();
+    match frame.and_then(|frame| Some((frame, frame.payload(&text)?))) {
+        Some((frame, payload)) => seen.push_parts(&[&frame.head, payload, &frame.tail]),
+        None => seen.push(&text),
+    }
 }
 
 fn texts_of(content: &MessageContent) -> Vec<&str> {
@@ -1379,6 +1447,113 @@ mod tests {
         );
     }
 
+    const SHELL_HEAD: &str = "<shell_results>\n<exit_code>0</exit_code>\n<stdout>";
+    const SHELL_TAIL: &str = "</stdout>\n<stderr></stderr>\n</shell_results>";
+
+    /// Under the size gate, so only cross-turn dedup touches it.
+    const INSTALL: &str = concat!(
+        "Resolved 46 packages in 126ms from the default index\n",
+        "Prepared 46 packages in 2.31s into the local cache\n",
+        "Installed 46 packages in 412ms into /usr/local\n",
+        "Bytecode compiled 1280 files in 3.02s for python3.12\n",
+        "Audited 46 packages; no known vulnerabilities found\n",
+    );
+
+    fn texts(messages: &[Message]) -> Vec<String> {
+        messages
+            .iter()
+            .map(|m| match &m.content {
+                MessageContent::Text(t) => t.clone(),
+                other => panic!("text in, text out, got {other:?}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_repeated_tool_result_keeps_its_envelope_around_the_pointer() {
+        let opts = EngineOptions::default();
+        let result = format!("{SHELL_HEAD}{INSTALL}{SHELL_TAIL}");
+        let mut messages = vec![
+            Message::text("tool", result.clone()),
+            Message::text("tool", result.clone()),
+        ];
+        run(&mut messages, &opts, RequestOptions::default());
+        let texts = texts(&messages);
+        assert_eq!(texts[0], result, "the first showing is never rewritten");
+        assert_eq!(
+            texts[1],
+            format!(
+                "{SHELL_HEAD}[... 5 lines omitted; shown in full earlier in this conversation]\n{SHELL_TAIL}"
+            )
+        );
+    }
+
+    #[test]
+    fn a_repeat_at_the_end_of_a_payload_never_takes_the_tags_after_it() {
+        // The earlier result ends with the same lines and the same closing
+        // tags, so a run matched across the whole result would carry on
+        // through `</stdout>` and `</shell_results>`.
+        let opts = EngineOptions::default();
+        let mut messages = vec![
+            Message::text(
+                "tool",
+                format!("{SHELL_HEAD}$ uv pip install -r requirements.txt\n{INSTALL}{SHELL_TAIL}"),
+            ),
+            Message::text(
+                "tool",
+                format!(
+                    "{SHELL_HEAD}$ uv pip install -r requirements-dev.txt\n{INSTALL}{SHELL_TAIL}"
+                ),
+            ),
+        ];
+        run(&mut messages, &opts, RequestOptions::default());
+        assert_eq!(
+            texts(&messages)[1],
+            format!(
+                "{SHELL_HEAD}$ uv pip install -r requirements-dev.txt\n[... 5 lines omitted; shown in full earlier in this conversation]\n{SHELL_TAIL}"
+            )
+        );
+    }
+
+    #[test]
+    fn a_repeated_search_keeps_its_closing_tag() {
+        // The compressed list can end in an omission marker rather than
+        // `</result>`, so it no longer reads as a search result's payload.
+        let opts = EngineOptions::default();
+        let list: Vec<String> = (0..60)
+            .map(|i| {
+                format!(
+                    "<result>\n<title>cadquery fillet guide, part {i}</title>\n<url>https://example.com/cadquery/{i}</url>\n<description>How fillet() picks edges, part {i}.</description>\n</result>"
+                )
+            })
+            .collect();
+        let result = format!("<results>\n{}\n</results>", list.join("\n"));
+        let mut messages = vec![
+            Message::text("tool", result.clone()),
+            Message::text("tool", result),
+        ];
+        run(&mut messages, &opts, RequestOptions::default());
+        for (k, text) in texts(&messages).iter().enumerate() {
+            assert!(
+                text.starts_with("<results>\n") && text.ends_with("\n</results>"),
+                "message {k}: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_enveloped_tool_result_is_counted_as_what_it_holds() {
+        let opts = EngineOptions::default();
+        let payload = log_payload(300);
+        let by_type = |text: String| {
+            let mut messages = vec![Message::text("tool", text)];
+            run(&mut messages, &opts, RequestOptions::default()).by_type
+        };
+        let bare = by_type(payload.clone());
+        assert!(!bare.is_empty(), "the bare payload compresses");
+        assert_eq!(by_type(format!("{SHELL_HEAD}{payload}{SHELL_TAIL}")), bare);
+    }
+
     #[test]
     fn a_cache_control_message_is_withheld() {
         let opts = EngineOptions::default();
@@ -1498,6 +1673,46 @@ mod tests {
         }
         assert_eq!(stats.by_type.get("stale_read"), Some(&1));
         assert!(!refs.is_empty());
+    }
+
+    #[test]
+    fn a_stale_read_in_an_envelope_keeps_its_tags() {
+        let opts = EngineOptions::default();
+        let file = "x = 1\n".repeat(200);
+        let mut messages = vec![
+            Message {
+                role: "tool".into(),
+                content: MessageContent::Text(format!("{SHELL_HEAD}{file}{SHELL_TAIL}")),
+                meta: MessageMeta {
+                    tool_name: Some("read_file".into()),
+                    file_path: Some("src/app.py".into()),
+                    ..Default::default()
+                },
+            },
+            Message {
+                role: "tool".into(),
+                content: MessageContent::Text("ok".into()),
+                meta: MessageMeta {
+                    tool_name: Some("write_file".into()),
+                    file_path: Some("src/app.py".into()),
+                    ..Default::default()
+                },
+            },
+        ];
+        let mut refs = opts.collector();
+        let stats = compress_messages(&mut messages, &opts, &RequestOptions::default(), &mut refs);
+        let out = &texts(&messages)[0];
+        let payload = out
+            .strip_prefix(SHELL_HEAD)
+            .and_then(|rest| rest.strip_suffix(SHELL_TAIL))
+            .unwrap_or_else(|| panic!("the envelope survives: {out}"));
+        assert!(
+            payload.starts_with("[Read content stale: src/app.py"),
+            "{payload}"
+        );
+        assert_eq!(stats.by_type.get("stale_read"), Some(&1));
+        let fragments: Vec<&str> = refs.pairs().iter().map(|(_, f)| f.as_str()).collect();
+        assert_eq!(fragments, vec![file.as_str()], "what is kept is the file");
     }
 
     #[test]
@@ -2049,5 +2264,51 @@ mod skip_reason_tests {
             &mut refs,
         );
         assert_eq!(stats.skipped_by_reason.get("below_min_chars"), Some(&1));
+    }
+
+    fn skipped_by_reason(text: &str) -> BTreeMap<String, u32> {
+        let mut refs = RefCollector::disabled();
+        let mut messages = vec![msg("tool", text)];
+        compress_messages(
+            &mut messages,
+            &opts(),
+            &RequestOptions::default(),
+            &mut refs,
+        )
+        .skipped_by_reason
+    }
+
+    #[test]
+    fn a_declined_envelope_names_the_type_of_what_it_holds() {
+        // Source whose bodies are all too short to elide.
+        let text: String = [
+            "load", "parse", "merge", "split", "render", "flush", "close", "open", "reset", "check",
+        ]
+        .iter()
+        .map(|name| {
+            format!(
+                "def {name}_records(rows):\n    return [row for row in rows if row.{name}_ok]\n\n\n"
+            )
+        })
+        .collect();
+        let bare = skipped_by_reason(&text);
+        assert!(
+            bare.keys().any(|k| k.starts_with("declined:")),
+            "the bare payload is declined, got {bare:?}"
+        );
+        let wrapped = format!(
+            "<shell_results>\n<exit_code>0</exit_code>\n<stdout>{text}</stdout>\n<stderr></stderr>\n</shell_results>"
+        );
+        assert_eq!(skipped_by_reason(&wrapped), bare);
+    }
+
+    #[test]
+    fn an_envelope_whose_payload_is_under_the_size_gate_says_so() {
+        // The result is large; what the compressors were offered is not.
+        let stderr = "warning: something on stderr\n".repeat(100);
+        let wrapped = format!(
+            "<shell_results>\n<exit_code>0</exit_code>\n<stdout>tiny\n</stdout>\n<stderr>{stderr}</stderr>\n</shell_results>"
+        );
+        assert_eq!(skipped_by_reason(&wrapped).get("below_min_chars"), Some(&1));
     }
 }

@@ -786,6 +786,35 @@ A splitter that stopped at the terminator left those two lines at the head of th
 
 The trade is visible in both directions. Holding two more lines out of the body costs the shipped corpus 0.36pp of coverage (16 of its 258 payloads carry the notice, most of them logs that folded those lines away); on a live codex sweep across nine payload types it is worth **+4.67pp overall**, almost all of it one payload going from nothing to 43%. §18.1's `fold_count_unsupported` and the golden vectors both moved with it, each recorded.
 
+### 7.1a Stirrup's envelope (`engine::envelope`)
+
+Stirrup (0.2.0) wraps every tool result in one XML element, which has a tail as well as a head:
+
+```
+<shell_results>
+<exit_code>0</exit_code>
+<stdout>…</stdout>
+<stderr>…</stderr>
+</shell_results>
+```
+
+Left on, the tags were content to everything downstream. Re-wrapping the corpus's codex outputs in a shell envelope took source files from 60.1% to 10.5% (19 of 23 not compressed at all) and tables from 82.6% to 13.3%. On a live terminal-bench run, a log fold cut the lines holding `</stdout>` and `<stderr>` and left its notice after `</shell_results>`, and cross-turn dedup dropped `</stderr>` and `</shell_results>` as lines shown earlier.
+
+So `compress_content` lifts the envelope before anything looks at the payload, as §7.1 does for the codex frame, and puts the head and tail back byte for byte. Detection, cross-turn dedup and the stale-read marker see the payload too. The dedup index records an envelope as head, payload and tail, so a payload's first line is matched without the `<stdout>` glued to it.
+
+| Shape | Payload | Kept as it is |
+|---|---|---|
+| `shell_results` | stdout, up to the first `</stdout>\n<stderr>` | exit code, stderr |
+| shell error | the `<details>` text | `<error_kind>`, `<advice>` |
+| `web_fetch` | the page body, or the error text | the url |
+| `results` (web search) | the `<result>` list | |
+| `page_snapshot` | the snapshot | |
+| `sub_agent_result` | the `<response>`, or the error text | `<finished>` |
+
+Only a result that is exactly one complete envelope is split; a sibling, or any text around it, leaves it content, handled as before. Nested envelopes peel up to 8 layers, and a deeper nest is left whole. `<results>` is peeled only when it holds `<result>` items, because a wrapper that plain may be another tool's. stderr is kept rather than compressed as a second payload: across 165 live Stirrup shell results that gives up 3% of their characters, though most of an install-heavy output. For the same reason the size floor applies to the payload, where around a codex frame it applies to the whole result: a large stderr must not send a few lines of stdout to the compressors.
+
+Measured with the same re-wrapping, the corpus goes from 64.3% to **67.4%** against 68.4% bare, and every kind now saves exactly the characters it saves bare; the remaining gap is the envelope's own characters.
+
 ### 7.2 Adaptive budget (`engine::adaptive`)
 
 `adaptive_k(items: list[str], minimum, maximum, bias=1.0) -> int`, deterministic and bounded:

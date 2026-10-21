@@ -483,6 +483,24 @@ async fn detect_reports_the_type_the_strategy_and_the_kind() {
     assert!(body["confidence"].as_f64().unwrap() > 0.0);
 }
 
+#[tokio::test]
+async fn detect_reports_the_type_of_what_a_stirrup_result_holds() {
+    let harness = Harness::memory();
+    let table: String = std::iter::once("id,name,score\n".to_string())
+        .chain((0..40).map(|i| format!("{i},user_{i},{}\n", i * 3)))
+        .collect();
+    let wrapped = format!(
+        "<shell_results>\n<exit_code>0</exit_code>\n<stdout>{table}</stdout>\n<stderr></stderr>\n</shell_results>"
+    );
+    let (status, body) = harness
+        .post("/v1/detect", json!({ "content": wrapped }))
+        .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["content_type"], "tabular");
+    assert_eq!(body["strategy"], "tabular");
+}
+
 // ---------------------------------------------------------------------------
 // retrieval
 // ---------------------------------------------------------------------------

@@ -23,6 +23,7 @@
 //! [`Kind::Mixed`], and only the folded branch emits the redraw marker.
 
 use kompressor_engine::detect::{detect_result, strategy_for};
+use kompressor_engine::envelope::payload_of;
 use kompressor_engine::markers::{has_envelope, has_marker, whitespace_only};
 use kompressor_engine::mixed::has_mixed_content;
 use kompressor_engine::options::EngineOptions;
@@ -194,8 +195,9 @@ pub fn explain(
     } = outcome;
     let chars_in = chars_len(content);
     let chars_out = chars_len(output);
-    let detection = detect_result(content, role, options);
-    let size_gate_passed = chars_in >= options.min_compress_chars;
+    let payload = payload_of(content);
+    let detection = detect_result(payload, role, options);
+    let size_gate_passed = chars_len(payload) >= options.min_compress_chars;
 
     let markers = markers_in(output);
     let named = refs_in(output);
@@ -217,8 +219,8 @@ pub fn explain(
         detection: DetectionView::new(&detection),
         strategy: strategy_name(strategy_for(&detection, options)).to_string(),
         forced_type: forced.map(|f| forced_name(f).to_string()),
-        route: route_view(content, options, forced, kind, size_gate_passed),
-        redraw: redraw_view(content, output, options, forced, size_gate_passed),
+        route: route_view(payload, options, forced, kind, size_gate_passed),
+        redraw: redraw_view(payload, output, options, forced, size_gate_passed),
         kind: kind.map(|k| k.as_str().to_string()),
         applied: applied.iter().map(|k| k.as_str().to_string()).collect(),
         handleless_marker_reason: handleless.then(|| handleless_reason(options)),

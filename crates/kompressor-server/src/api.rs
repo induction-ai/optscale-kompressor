@@ -311,7 +311,11 @@ async fn detect(
     let role = body.role.unwrap_or_else(|| "user".to_string());
 
     let detection = run_engine(&state, move || {
-        let detection = kompressor_engine::detect::detect_result(&content, &role, &options);
+        let detection = kompressor_engine::detect::detect_result(
+            kompressor_engine::envelope::payload_of(&content),
+            &role,
+            &options,
+        );
         let strategy = kompressor_engine::detect::strategy_for(&detection, &options);
         (detection, strategy)
     })
